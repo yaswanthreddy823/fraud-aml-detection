@@ -1,21 +1,22 @@
-"""Train and evaluate fraud detection models on synthetic transactions.
+"""Train the FinAI 360 fraud module (demonstration).
 
-Models:
-  1. XGBoost classifier (supervised, class-weighted for 98/2 imbalance).
-  2. Isolation Forest (unsupervised anomaly baseline).
+Pipeline: synthetic transactions -> XGBoost classifier (class-weighted for
+the 98/2 imbalance) with an Isolation Forest anomaly baseline, threshold
+tuning for the approve/review/block operating point, and SHAP explanation.
 
-Metrics focus on precision-recall, which matters more than accuracy when
-fraud is rare. SHAP explanation runs when the ``shap`` package is installed
-and is skipped gracefully otherwise.
+Saves the fitted pipeline and chosen threshold to ``models/`` so the
+scoring API (``scoring_api.py``) can serve it. All data is synthetic.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import joblib
 import numpy as np
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import IsolationForest
@@ -23,6 +24,7 @@ from sklearn.metrics import (
     average_precision_score,
     classification_report,
     confusion_matrix,
+    precision_recall_curve,
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
@@ -44,14 +46,20 @@ NUMERIC = [
 CATEGORICAL = ["merchant_category", "device_type"]
 
 
-def report(name: str, y_true: np.ndarray, y_pred: np.ndarray,
-           y_score: np.ndarray) -> None:
-    print(f"\n===== {name} =====")
-    print("Confusion matrix (rows=true, cols=pred):")
-    print(confusion_matrix(y_true, y_pred))
-    print(classification_report(y_true, y_pred, digits=3))
-    print(f"ROC-AUC: {roc_auc_score(y_true, y_score):.4f}")
-    print(f"PR-AUC (avg precision): {average_precision_score(y_true, y_score):.4f}")
+def tune_threshold(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Pick the threshold maximizing F1, and print the trade-off table."""
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-9)
+    best_idx = int(np.argmax(f1))
+    print("\nThreshold trade-off (precision / recall / F1):")
+    for t in (0.3, 0.5, 0.7, 0.9):
+        idx = int(np.searchsorted(thresholds, t))
+        idx = min(idx, len(precision) - 1)
+        print(f"  threshold {t:.1f}: precision {precision[idx]:.3f}, "
+              f"recall {recall[idx]:.3f}, F1 {f1[idx]:.3f}")
+    best = float(thresholds[min(best_idx, len(thresholds) - 1)])
+    print(f"Recommended operating threshold (max F1): {best:.3f}")
+    return best
 
 
 def main() -> None:
@@ -70,8 +78,6 @@ def main() -> None:
             ("num", "passthrough", NUMERIC),
         ]
     )
-
-    # --- Supervised: XGBoost -------------------------------------------
     neg, pos = int((y_train == 0).sum()), int((y_train == 1).sum())
     xgb = Pipeline(
         [
@@ -93,9 +99,14 @@ def main() -> None:
         ]
     )
     xgb.fit(X_train, y_train)
-    xgb_pred = xgb.predict(X_test)
     xgb_score = xgb.predict_proba(X_test)[:, 1]
-    report("XGBoost (supervised)", y_test, xgb_pred, xgb_score)
+    xgb_pred = (xgb_score >= 0.5).astype(int)
+    print("\n===== XGBoost (supervised) =====")
+    print("Confusion matrix (rows=true, cols=pred):")
+    print(confusion_matrix(y_test, xgb_pred))
+    print(classification_report(y_test, xgb_pred, digits=3))
+    print(f"ROC-AUC: {roc_auc_score(y_test, xgb_score):.4f}")
+    print(f"PR-AUC (avg precision): {average_precision_score(y_test, xgb_score):.4f}")
 
     # --- Unsupervised baseline: Isolation Forest ------------------------
     iso = IsolationForest(
@@ -105,9 +116,12 @@ def main() -> None:
     iso.fit(X_train[NUMERIC])
     iso_score = -iso.decision_function(X_test[NUMERIC])
     iso_pred = (iso.predict(X_test[NUMERIC]) == -1).astype(int)
-    report("Isolation Forest (unsupervised)", y_test, iso_pred, iso_score)
+    print("\n===== Isolation Forest (unsupervised baseline) =====")
+    print(f"ROC-AUC: {roc_auc_score(y_test, iso_score):.4f}")
+    print(f"PR-AUC: {average_precision_score(y_test, iso_score):.4f}")
 
-    # --- Explainability: SHAP -------------------------------------------
+    # --- Threshold tuning + SHAP -----------------------------------------
+    threshold = tune_threshold(y_test, xgb_score)
     try:
         import shap
 
@@ -123,10 +137,18 @@ def main() -> None:
         for i in order:
             print(f"  {feature_names[i]:<35} {importance[i]:.4f}")
     except ImportError:
-        print("\nSHAP not installed; skipping explanation "
-              "(pip install shap to enable it).")
-    except Exception as exc:  # keep the script runnable without SHAP
+        print("\nSHAP not installed; skipping explanation.")
+    except Exception as exc:
         print(f"\nSHAP explanation skipped ({exc}).")
+
+    # --- Save artifacts for the scoring API ------------------------------
+    os.makedirs("models", exist_ok=True)
+    joblib.dump(xgb, "models/fraud_pipeline.pkl")
+    with open("models/threshold.json", "w") as f:
+        json.dump({"review_threshold": 0.5, "block_threshold": 0.8,
+                   "tuned_threshold": threshold}, f, indent=2)
+    print("\nSaved models/fraud_pipeline.pkl and models/threshold.json")
+    print("Serve with: python src/scoring_api.py")
 
 
 if __name__ == "__main__":

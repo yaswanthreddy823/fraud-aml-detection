@@ -1,9 +1,11 @@
 """Synthetic transaction data generator for fraud detection experiments.
 
-Generates realistic-looking card transactions with a small fraud minority.
-Fraud is driven by interpretable risk signals (unusual amount, odd hour,
-new device, distant location, high velocity) plus noise, so models must
-learn signal rather than memorize a rule.
+Two profiles generate the data: legitimate transactions and a small fraud
+minority (~2%). Fraud rows are drawn from shifted distributions on
+observable features (larger amounts, odd hours, new devices, far
+locations, high velocity, young accounts), so the label is learnable from
+the features with realistic overlap -- the way fraud behaves in the real
+world -- rather than from an unobservable noise term.
 
 All data is synthetic. No real customer or employer data is used.
 """
@@ -24,43 +26,53 @@ MERCHANT_CATEGORIES = [
 ]
 DEVICE_TYPES = ["mobile", "desktop", "pos", "tablet"]
 
+LEGIT_MERCHANT_P = [0.28, 0.12, 0.08, 0.18, 0.10, 0.16, 0.08]
+FRAUD_MERCHANT_P = [0.20, 0.16, 0.10, 0.14, 0.08, 0.20, 0.12]
+LEGIT_DEVICE_P = [0.45, 0.25, 0.20, 0.10]
+FRAUD_DEVICE_P = [0.48, 0.27, 0.15, 0.10]
+# Daytime-weighted hours for legitimate traffic; fraud skews to odd hours.
+LEGIT_HOUR_P = np.array(
+    [0.01, 0.01, 0.01, 0.01, 0.01, 0.02, 0.03, 0.05, 0.07, 0.07, 0.07, 0.07,
+     0.07, 0.07, 0.06, 0.06, 0.06, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01, 0.01]
+)
+LEGIT_HOUR_P /= LEGIT_HOUR_P.sum()
+FRAUD_HOUR_P = np.array(
+    [0.05, 0.05, 0.05, 0.05, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04,
+     0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
+)
+FRAUD_HOUR_P /= FRAUD_HOUR_P.sum()
+
 
 def make_dataset(
     n: int = 50_000, fraud_rate: float = 0.02, seed: int = 42
 ) -> pd.DataFrame:
     """Return a DataFrame of synthetic transactions with an ``is_fraud`` label."""
     rng = np.random.default_rng(seed)
+    is_fraud = (rng.random(n) < fraud_rate).astype(int)
+    fraud = is_fraud == 1
 
-    amount = rng.lognormal(mean=3.5, sigma=1.1, size=n)  # median ~$33
-    hour = rng.integers(0, 24, size=n)
-    merchant = rng.choice(
-        MERCHANT_CATEGORIES,
-        size=n,
-        p=[0.28, 0.12, 0.08, 0.18, 0.10, 0.16, 0.08],
-    )
-    device = rng.choice(DEVICE_TYPES, size=n, p=[0.45, 0.25, 0.20, 0.10])
+    # Baseline (legitimate) distributions for every row.
+    amount = rng.lognormal(mean=3.5, sigma=1.1, size=n)
+    hour = rng.choice(24, size=n, p=LEGIT_HOUR_P)
+    merchant = rng.choice(MERCHANT_CATEGORIES, size=n, p=LEGIT_MERCHANT_P)
+    device = rng.choice(DEVICE_TYPES, size=n, p=LEGIT_DEVICE_P)
     account_age_days = rng.integers(30, 3650, size=n)
     distance_km = np.abs(rng.normal(loc=15.0, scale=40.0, size=n))
     txns_last_24h = rng.poisson(lam=2.0, size=n)
     is_new_device = (rng.random(size=n) < 0.15).astype(int)
     is_international = (rng.random(size=n) < 0.12).astype(int)
 
-    # Latent fraud risk: risk signals plus noise.
-    logit = (
-        -4.0
-        + 0.9 * (amount > 500)
-        + 0.7 * (hour < 5)
-        + 0.8 * is_new_device
-        + 0.6 * (distance_km > 200)
-        + 0.5 * is_international
-        + 0.4 * (txns_last_24h >= 6)
-        + 0.3 * (account_age_days < 180)
-        + rng.normal(0, 1.0, size=n)
-    )
-    prob = 1 / (1 + np.exp(-logit))
-    # Threshold on ranked risk so the fraud share matches fraud_rate exactly.
-    threshold = np.quantile(prob, 1 - fraud_rate)
-    is_fraud = (prob >= threshold).astype(int)
+    # Fraud profile: shift the observable distributions for fraud rows.
+    m = int(fraud.sum())
+    amount[fraud] = rng.lognormal(mean=4.5, sigma=1.2, size=m)
+    hour[fraud] = rng.choice(24, size=m, p=FRAUD_HOUR_P)
+    merchant[fraud] = rng.choice(MERCHANT_CATEGORIES, size=m, p=FRAUD_MERCHANT_P)
+    device[fraud] = rng.choice(DEVICE_TYPES, size=m, p=FRAUD_DEVICE_P)
+    account_age_days[fraud] = rng.integers(30, 2400, size=m)
+    distance_km[fraud] = np.abs(rng.normal(loc=100.0, scale=200.0, size=m))
+    txns_last_24h[fraud] = rng.poisson(lam=3.0, size=m)
+    is_new_device[fraud] = (rng.random(size=m) < 0.35).astype(int)
+    is_international[fraud] = (rng.random(size=m) < 0.25).astype(int)
 
     return pd.DataFrame(
         {
