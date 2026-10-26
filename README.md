@@ -85,8 +85,7 @@ python src/scoring_api.py
 # -> {"risk_score": ..., "decision": "review|block|approve", "rules_triggered": [...]}
 ```
 
-Tests: `python -m pytest tests/ -q` (CI runs compile checks + tests on
-every push).
+Tests: `python -m pytest tests/ -q`.
 
 ## Project structure
 
